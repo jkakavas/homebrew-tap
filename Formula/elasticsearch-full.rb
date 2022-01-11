@@ -1,12 +1,17 @@
 class ElasticsearchFull < Formula
   desc "Distributed search & analytics engine"
   homepage "https://www.elastic.co/products/elasticsearch"
-  url "https://artifacts.elastic.co/downloads/elasticsearch/elasticsearch-7.14.1-darwin-x86_64.tar.gz?tap=elastic/homebrew-tap"
-  version "7.14.1"
+  url "file:///path/here"
+  version "8.0.0"
   sha256 "ac1949836c64d4d1b1b9273400d5fd3a91bb6964ded67d2947e93324fad94028"
   conflicts_with "elasticsearch"
 
   bottle :unneeded
+
+  resource "open3" do
+    url "https://rubygems.org/downloads/open3-0.1.1.gem"
+    sha256 "59a2c2cfe7a90ae3a35180e6acb2499699a9241bd2fedf18e46e3e8756bbe878"
+  end
 
   def cluster_name
     "elasticsearch_#{ENV["USER"]}"
@@ -28,6 +33,49 @@ class ElasticsearchFull < Formula
       # 2. Configure paths
       s.sub!(%r{#\s*path\.data: /path/to.+$}, "path.data: #{var}/lib/elasticsearch/")
       s.sub!(%r{#\s*path\.logs: /path/to.+$}, "path.logs: #{var}/log/elasticsearch/")
+    end
+
+    with_env(ES_MAIN_CLASS: "org.elasticsearch.xpack.security.cli.ConfigInitialNode", ES_ADDITIONAL_SOURCES: "x-pack-env;x-pack-security-env", ES_ADDITIONAL_CLASSPATH_DIRECTORIES: "lib/tools/security-cli") do
+      output, status = Open3.capture2(libexec/"bin/elasticsearch-cli", :stdin_data => "")
+    end
+    if status.success?
+      with_env(ES_MAIN_CLASS: "org.elasticsearch.xpack.security.enrollment.tool.AutoConfigGenerateElasticPasswordHash", ES_ADDITIONAL_SOURCES: "x-pack-env;x-pack-security-env", ES_ADDITIONAL_CLASSPATH_DIRECTORIES: "lib/tools/security-cli") do
+        @password, @autoconfiguration_status = Open3.capture2(libexec/"bin/elasticsearch-cli", :stdin_data => "")
+      end
+      if password_status.success?
+        @autoconfiguration_output = <<~EOS
+            ##########         Security autoconfiguration information         ############
+            #                                                                            #
+            # Authentication and Authorization are enabled.                              #
+            # TLS for the transport and the http layers is enabled and configured.       #
+            #                                                                            #
+            # The password of the elastic superuser will be set to: ${INITIAL_PASSWORD} #
+            # upon starting elasticsearch for the first time                             #
+            #                                                                            #
+            ##############################################################################
+            EOS
+      end
+    else
+      if status.80?
+        @autoconfiguration_output = <<~EOS
+            ##########         Security autoconfiguration information         ############
+            #                                                                            #
+            # Security features appear to be already configured.                         #
+            #                                                                            #
+            ##############################################################################
+            EOS
+      else
+        @autoconfiguration_output = <<~EOS
+            ##########         Security autoconfiguration information         ############
+            #                                                                            #
+            # Failed to auto-configure security features.                                #
+            # Authentication and Authorization are enabled.                              #
+            # You can use elasticsearch-reset-elastic-password to set a password         #
+            # for the elastic user.                                                      #
+            #                                                                            #
+            ##############################################################################
+            EOS
+      end
     end
 
     inreplace "#{libexec}/config/jvm.options", %r{logs/gc.log}, "#{var}/log/elasticsearch/gc.log"
@@ -63,6 +111,7 @@ class ElasticsearchFull < Formula
       Plugins: #{var}/elasticsearch/plugins/
       Config:  #{etc}/elasticsearch/
     EOS
+    s += @autoconfiguration_output
 
     s
   end
@@ -109,7 +158,7 @@ class ElasticsearchFull < Formula
     mkdir testpath/"config"
     cp etc/"elasticsearch/jvm.options", testpath/"config"
     cp etc/"elasticsearch/log4j2.properties", testpath/"config"
-    touch testpath/"config/elasticsearch.yml"
+    cp etc/"elasticsearch/elasticsearch.yml", testpath/"config"
 
     ENV["ES_PATH_CONF"] = testpath/"config"
 
@@ -148,5 +197,33 @@ class ElasticsearchFull < Formula
     ensure
       Process.kill(9, pid.read.to_i)
     end
+
+    if @autoconfiguration_status.success?
+
+      server = TCPServer.new(0)
+      port = server.addr[1]
+      server.close
+
+      rm testpath/"config"
+      mkdir testpath/"config"
+      cp etc/"elasticsearch/jvm.options", testpath/"config"
+      cp etc/"elasticsearch/log4j2.properties", testpath/"config"
+      cp etc/"elasticsearch/elasticsearch.yml", testpath/"config"
+      cp etc/"elasticsearch/elasticsearch.keystore", testpath/"config"
+      cp -r etc/"elasticsearch/tls_auto_config_initial_node_*", testpath/"config"
+
+      ENV["ES_PATH_CONF"] = testpath/"config"
+
+      pid = testpath/"pid"
+      begin
+        system "#{bin}/elasticsearch", "-d", "-p", pid, "-Epath.data=#{testpath}/data", "-Epath.logs=#{testpath}/logs", "-Enode.name=test-security-autoconfiguration", "-Ehttp.port=#{port}"
+       sleep 30
+        system "curl", "-XGET", "https://localhost:#{port}/", "-uelastic"+@password
+        output = shell_output("curl -s -XGET https://localhost:#{port}/_cat/nodes")
+        assert_match "test-security-autoconfiguration", output
+      ensure
+        Process.kill(9, pid.read.to_i)
+      end
+
   end
 end
